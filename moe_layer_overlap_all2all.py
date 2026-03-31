@@ -487,40 +487,40 @@ class MoELayerOverlapAllToAll(torch.autograd.Function):
             ep_group = parallel_state.get_tensor_and_expert_parallel_group()
         deepep_buffer = DeepEPBuffer.get_deepep_buffer(ep_group)
         
-        # Step 1: Backward through combine (distribute gradients to experts)
+        # Step 1: Backward through dispatch (distribute gradients to experts)
         grad_output = args[0]
-        # Reshape grad_output to match combine input shape
+        # Reshape grad_output to match dispatch input shape
         grad_output_reshaped = grad_output.view(-1, grad_output.shape[-1])
-        # Use combine in reverse to distribute gradients to experts
-        grad_expert_output = deepep_buffer.combine(
+        # Use dispatch in reverse to distribute gradients to experts
+        grad_expert_output = deepep_buffer.dispatch(
             grad_output_reshaped, 
             indices, 
-            None,  # src_idx - not needed for backward
-            None,  # put_offset - not needed for backward
+            tokens_per_expert, 
             res_send_token_small, 
-            probs_f16, 
+            None,  # topk_weights - not needed for backward
             new_topk_idx
-        )
+        )[0]  # Get the first return value (expandx_out)
         
         # Step 2: Backward through experts
         backward_func(experts_graph, grad_expert_output)
         
-        # Step 3: Backward through dispatch (collect gradients from experts)
+        # Step 3: Backward through combine (collect gradients from experts)
         # Get gradient from expert input (from detached inputs)
         if expert_inputs_detach and len(expert_inputs_detach) > 0:
             # Get the first input tensor (dispatched_input)
             dispatched_input_detach = expert_inputs_detach[0]
             grad_expert_input = dispatched_input_detach.grad
             if grad_expert_input is not None:
-                # Use dispatch in reverse to collect gradients
-                grad_hidden_states = deepep_buffer.dispatch(
+                # Use combine in reverse to collect gradients
+                grad_hidden_states = deepep_buffer.combine(
                     grad_expert_input, 
                     indices, 
-                    tokens_per_expert, 
+                    None,  # src_idx - not needed for backward
+                    None,  # put_offset - not needed for backward
                     res_send_token_small, 
-                    None,  # topk_weights - not needed for backward
+                    probs_f16, 
                     new_topk_idx
-                )[0]  # Get the first return value (expandx_out)
+                )
                 
                 # Reshape back to original input shape
                 grad_hidden_states = grad_hidden_states.view(detach_input.shape)
