@@ -1,0 +1,550 @@
+# Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+
+import inspect
+import torch
+
+from mindspeed.core.transformer.moe.grouped_matmul_util import get_gmm_quant_func, get_gmm_op_cls
+from mindspeed.moe.utils import MoEAuxLossAutoScaler
+from mindspeed.core.transformer.moe.moe_feature.overlap.comm_utils import async_all_to_all
+from mindspeed.ops.gmm import GMMFunction
+from mindspeed.core.transformer.moe.moe_feature.overlap.moe_common import (
+    forward_func, backward_func,
+    only_recompute_activation,
+    set_gemm_backward_need_tensors, get_all2all_experts_output,
+    )
+from mindspeed.core.fusions.fused_bias_swiglu import fused_swiglu
+from mindspeed.core.transformer.moe.moe_feature.overlap.moe_common import only_recompute_activation
+from mindspeed.core.transformer.moe.moe_feature import (
+    tensor_parallel,
+    parallel_state,
+    MoELayer,
+    permute,
+    save_to_aux_losses_tracker,
+    sort_chunks_by_idxs,
+    gather_from_sequence_parallel_region,
+    )
+
+# 从配置中读取 DeepEP 使用标志，而不是硬编码
+use_deep_ep = False  # 默认值，实际使用时应从配置中读取
+
+def gmm_op(x, weight, bias, group_list, group_type):
+    return GMMFunction.builder.load().npu_gmm([x], [weight], bias, group_list, group_type, 0)
+
+
+class MoELayerOverlapAllToAll(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden_states, config, moe_layer: MoELayer):
+        ctx.config = config
+        save_tensors = []
+        ctx.input_shape = hidden_states.shape
+        ctx.moe_layer = moe_layer
+        hidden_states = hidden_states.detach()
+        hidden_states.requires_grad = True
+        ctx.is_only_recompute_activation = only_recompute_activation(config, moe_layer.layer_number)
+        # router
+        with torch.enable_grad():
+            scores, routing_map = moe_layer.router(hidden_states)
+
+        save_tensors.append(scores)
+        scores = scores.detach()
+        scores.requires_grad = True
+        save_tensors.append(scores)
+        moe_zero_memory = config.moe_zero_memory
+        n_shared_experts = config.n_shared_experts
+        ctx.n_shared_experts = n_shared_experts
+        ctx.moe_zero_memory = moe_zero_memory
+        moe_shared_expert_intermediate_size = config.moe_shared_expert_intermediate_size
+        group_limited_greedy = hasattr(config, 'moe_router_load_balancing_type') and config.moe_router_load_balancing_type == "group_limited_greedy"
+        ctx.shared_expert_overlap = moe_layer.shared_expert_overlap
+
+        # if shared_expert_overlap, save share_experts graph separately for backward.
+        if ctx.shared_expert_overlap:
+            ctx.share_experts_graph_list = []
+        else:
+            ctx.share_experts_graph_list = None
+
+        if moe_zero_memory == "level1" and not ctx.is_only_recompute_activation:
+            ctx.activation_func = moe_layer.experts.activation_func
+            ctx.hidden_size = moe_layer.experts.config.hidden_size
+            ctx.num_local_experts = moe_layer.experts.num_local_experts
+            ctx.weight1 = moe_layer.experts.weight1
+            ctx.moe_grouped_gemm = moe_layer.token_dispatcher.config.moe_grouped_gemm
+            ctx.num_local_experts = moe_layer.token_dispatcher.num_local_experts
+
+        if n_shared_experts or moe_shared_expert_intermediate_size:
+            ctx.shared_experts = moe_layer.shared_experts
+            if config.moe_zero_memory == "level1" and not ctx.is_only_recompute_activation:
+                moe_layer.shared_experts.activation_function = fused_swiglu if config.gated_linear_unit else moe_layer.shared_experts.activation_func
+
+        save_tensors.append(routing_map)
+
+        (dispatched_input, tokens_per_expert, global_probs) = moe_layer.token_dispatcher.token_permutation(
+            hidden_states, scores, routing_map, save_tensors, ctx
+        )
+
+        (expert_output, mlp_bias), *expert_inputs_detach = forward_func(moe_layer.experts, (dispatched_input, tokens_per_expert, global_probs, ctx))
+        save_tensors.append(expert_output)
+        # Save detached expert inputs for backward
+        save_tensors.append(expert_inputs_detach)
+        # Handle token_unpermutation based on DeepEP usage
+        if use_deep_ep:
+            # For DeepEP, token_unpermutation is a pure communication op without grad
+            output = moe_layer.token_dispatcher.token_unpermutation(expert_output, mlp_bias, save_tensors)[0]
+            save_tensors.append(None)
+        else:
+            # For non-DeepEP, use forward_func to track gradients
+            (output), expert_output_datach, *_ = forward_func(moe_layer.token_dispatcher.token_unpermutation, (expert_output, mlp_bias, save_tensors))
+            save_tensors.append(expert_output_datach)
+            expert_output_datach.untyped_storage().resize_(0)
+
+        if group_limited_greedy:
+            save_tensors.append(moe_layer.router.l_aux)
+            moe_layer.router.l_aux = moe_layer.router.l_aux.detach()
+            moe_layer.router.l_aux.requires_grad = True
+            save_tensors.append(moe_layer.router.l_aux)
+            with torch.enable_grad():
+                save_to_aux_losses_tracker(
+                    "load_balancing_loss",
+                    moe_layer.router.l_aux,
+                    moe_layer.layer_number,
+                    moe_layer.config.num_layers,
+                )
+                save_to_aux_losses_tracker(
+                    "load_balancing_expert_level_loss",
+                    moe_layer.router.l_expert_aux / config.moe_aux_loss_coeff,
+                    moe_layer.layer_number,
+                    moe_layer.config.num_layers,
+                )
+                if hasattr(moe_layer.router, 'l_device_aux'):
+                    save_to_aux_losses_tracker(
+                        "load_balancing_device_level_loss",
+                        moe_layer.router.l_device_aux / config.moe_device_level_aux_loss_coeff,
+                        moe_layer.layer_number,
+                        moe_layer.config.num_layers,
+                    )
+                if hasattr(moe_layer.router, 'l_comm_aux'):
+                    save_to_aux_losses_tracker(
+                        "load_balancing_comm_level_loss",
+                        moe_layer.router.l_comm_aux / config.moe_comm_aux_loss_coeff,
+                        moe_layer.layer_number,
+                        moe_layer.config.num_layers,
+                    )
+                output = MoEAuxLossAutoScaler.apply(output, moe_layer.router.l_aux)
+        else:
+            save_tensors.append(None)
+            save_tensors.append(None)
+
+        #unpermute2_graph
+        save_tensors.append(output)
+        #detach_input
+        save_tensors.append(hidden_states)
+
+        if moe_zero_memory == "level1" and not ctx.is_only_recompute_activation:
+            ctx.tokens_per_expert = tokens_per_expert
+
+        ctx.output_splits = moe_layer.token_dispatcher.output_splits
+        ctx.input_splits = moe_layer.token_dispatcher.input_splits
+        ctx.router_topk = moe_layer.token_dispatcher.config.moe_router_topk
+        ctx.num_global_tokens_per_local_expert_cpu = moe_layer.token_dispatcher.num_global_tokens_per_local_expert_cpu
+        ctx.sort_input_by_local_experts = moe_layer.token_dispatcher.sort_input_by_local_experts
+        ctx.output_splits_tp = moe_layer.token_dispatcher.output_splits_tp
+        ctx.num_out_tokens = moe_layer.token_dispatcher.num_out_tokens
+
+        #save shared_experts overlap backwards tensor.
+        if moe_layer.shared_expert_overlap:
+            ctx.save_for_backward(*ctx.share_experts_graph_list)
+
+        output_sum = output.detach()
+        ctx.save_for_backward(*save_tensors)
+        return output_sum, mlp_bias
+
+    @staticmethod
+    def backward(ctx, *args):
+        if use_deep_ep:
+            return MoELayerOverlapAllToAll.backward_deepep(ctx, *args)
+        else:
+            return MoELayerOverlapAllToAll.backward_src(ctx, *args)
+
+    @staticmethod
+    def backward_src(ctx, *args):
+
+        (route_graph, detach_scores,
+         routing_map,
+         permute1_graph, permuted_probs_graph,
+         permute2_input_detach, permute2_graph,
+         permute2_prob_detach, permute2_prob_graph,
+         experts_graph, expert_inputs,
+         unpermute1_input_detach,
+         l_aux_graph, l_aux_detach, unpermute2_graph,
+         detach_input, 
+         ) = ctx.saved_tensors
+
+        n_shared_experts = ctx.n_shared_experts
+        moe_zero_memory = ctx.moe_zero_memory
+
+        output_splits = ctx.output_splits
+        input_splits = ctx.input_splits
+        num_out_tokens = ctx.num_out_tokens
+
+        num_global_tokens_per_local_expert_cpu = ctx.num_global_tokens_per_local_expert_cpu
+        sort_input_by_local_experts = ctx.sort_input_by_local_experts
+        output_splits_tp = ctx.output_splits_tp
+
+        #Get share_expert_graph for backward.
+        if ctx.moe_layer.shared_expert_overlap:
+            (cached_fc1_input_graph, 
+            cached_fc1_input_detach,
+        ) = ctx.share_experts_graph_list
+
+        set_gemm_backward_need_tensors(
+            ((detach_input, detach_scores, routing_map, num_global_tokens_per_local_expert_cpu, 
+             sort_input_by_local_experts),
+             permute2_input_detach, permute2_graph,
+             permute2_prob_detach, permute2_prob_graph,
+             output_splits, input_splits, output_splits_tp, num_out_tokens))
+
+        if moe_zero_memory == "level1" and not ctx.is_only_recompute_activation:
+            with torch.no_grad():
+                # Recompute token rearrange in permutation1
+                permutated_local_input_tokens, permuted_probs, _ = permute(
+                    detach_input.view(-1, detach_input.shape[-1]), routing_map, num_out_tokens=num_out_tokens,
+                    probs=detach_scores, fused=ctx.config.moe_permute_fusion
+                )
+
+                if ctx.config.sequence_parallel:
+                    cached_fc1_input_ = gather_from_sequence_parallel_region(
+                        detach_input, tensor_parallel_output_grad=True
+                    )
+                else:
+                    cached_fc1_input_ = detach_input
+
+                # Recompute expert parallel AlltoAll communication.
+                _, global_input_tokens, permute1_ep_all_to_all_handle = async_all_to_all(
+                    permutated_local_input_tokens,
+                    ctx.output_splits,
+                    ctx.input_splits,
+                    parallel_state.get_expert_model_parallel_group(),
+                )
+                # Recompute cached_fc1_input.
+                # Use Megatron's shared experts fc1 to overlap global_input_tokens Alltoall.
+                if n_shared_experts:
+                    cached_fc1_input_size = cached_fc1_input_.untyped_storage().size()
+                    ctx.cached_fc1_input.untyped_storage().resize_(cached_fc1_input_size)
+                    ctx.cached_fc1_input.untyped_storage().copy_(cached_fc1_input_.untyped_storage())
+                    shared_fc1_out, bias_parallel = ctx.moe_layer.token_dispatcher.shared_experts.linear_fc1(cached_fc1_input_)
+                    #Avoid cached_fc1_input memory blast when TP=1.
+                    if ctx.config.sequence_parallel:
+                        cached_fc1_input_.untyped_storage().resize_(0)
+
+                permute1_ep_all_to_all_handle.wait()
+                permutated_local_input_tokens.untyped_storage().resize_(0)
+
+                _, global_probs, permute1_probs_handle = async_all_to_all(
+                    permuted_probs,
+                    ctx.output_splits,
+                    ctx.input_splits,
+                    parallel_state.get_expert_model_parallel_group(),
+                )
+
+        if moe_zero_memory == "level1" and not ctx.is_only_recompute_activation:
+            if n_shared_experts:
+                with torch.no_grad():
+                    # Recompute act of shared experts.
+                    # Use Megatron's shared experts act to overlap global_probs Alltoall.
+                    from mindspeed.core.transformer.moe.moe_feature import (
+                        bias_geglu_impl,
+                        bias_gelu_impl,
+                        bias_swiglu_impl)
+                    import torch.nn.functional as F
+                    if ctx.moe_layer.token_dispatcher.shared_experts.config.bias_activation_fusion:
+                        if ctx.moe_layer.token_dispatcher.shared_experts.activation_func == F.gelu:
+                            if ctx.moe_layer.token_dispatcher.shared_experts.config.gated_linear_unit:
+                                shared_act_out = bias_geglu_impl(
+                                    shared_fc1_out, bias_parallel
+                                )
+                            else:
+                                assert ctx.moe_layer.token_dispatcher.shared_experts.config.add_bias_linear is True
+                                shared_act_out = bias_gelu_impl(shared_fc1_out, bias_parallel)
+                        elif ctx.moe_layer.token_dispatcher.shared_experts.activation_func == F.silu and ctx.moe_layer.token_dispatcher.shared_experts.config.gated_linear_unit:
+                            shared_act_out = bias_swiglu_impl(
+                                shared_fc1_out,
+                                bias_parallel,
+                                ctx.moe_layer.token_dispatcher.shared_experts.config.activation_func_fp8_input_store,
+                            )
+                        else:
+                            raise ValueError("Only support fusion of gelu and swiglu")
+                    else:
+                        if bias_parallel is not None:
+                            shared_act_out = shared_fc1_out + bias_parallel
+                        if ctx.moe_layer.token_dispatcher.shared_experts.config.gated_linear_unit:
+
+                            def glu(x):
+                                x = torch.chunk(x, 2, dim=-1)
+                                return ctx.moe_layer.token_dispatcher.shared_experts.config.activation_func(x[0]) * x[1]
+
+                            shared_act_out = glu(shared_fc1_out)
+                        else:
+                            shared_act_out = ctx.moe_layer.token_dispatcher.shared_experts.activation_func(shared_fc1_out)
+
+                    shared_act_out_size = shared_act_out.untyped_storage().size()
+                    ctx.shared_act_out.untyped_storage().resize_(shared_act_out_size)
+                    ctx.shared_act_out.untyped_storage().copy_(shared_act_out.untyped_storage())
+                    shared_act_out.untyped_storage().resize_(0)
+
+                    shared_fc1_out_size = shared_fc1_out.untyped_storage().size()
+                    ctx.cached_fc1_output.untyped_storage().resize_(shared_fc1_out_size)
+                    ctx.cached_fc1_output.untyped_storage().copy_(shared_fc1_out.untyped_storage())
+                    shared_fc1_out.untyped_storage().resize_(0)
+
+        if moe_zero_memory == "level1" and not ctx.is_only_recompute_activation:
+            with torch.no_grad():
+                if parallel_state.get_expert_tensor_parallel_world_size() > 1:
+                    global_input_tokens = tensor_parallel.gather_from_sequence_parallel_region(
+                        global_input_tokens,
+                        group=parallel_state.get_expert_tensor_parallel_group(),
+                        output_split_sizes=(
+                            output_splits_tp.tolist() if output_splits_tp is not None else None
+                        ),
+                    )
+
+                permute1_probs_handle.wait()
+                if parallel_state.get_expert_tensor_parallel_world_size() > 1:
+                    global_probs = tensor_parallel.gather_from_sequence_parallel_region(
+                        global_probs,
+                        group=parallel_state.get_expert_tensor_parallel_group(),
+                        output_split_sizes=(
+                            output_splits_tp.tolist() if output_splits_tp is not None else None
+                        ),
+                    )
+
+                if ctx.num_local_experts > 1:
+                    permuted_probs.untyped_storage().resize_(0)
+                    # Recompute permutation2.
+                    global_input_tokens, permuted_probs_ = sort_chunks_by_idxs(
+                        global_input_tokens,
+                        num_global_tokens_per_local_expert_cpu.ravel(),
+                        sort_input_by_local_experts,
+                        probs=global_probs,
+                    )
+                global_probs.untyped_storage().resize_(0)
+                # Recompute mm1 and act.
+                input_, mm1_out, expert_permuted_probs, act_out, act_without_probs = ctx.recompute_tensors
+                ctx.recompute_tensors = None
+                if global_input_tokens.nelement() != 0:
+                    group_list = torch.cumsum(ctx.tokens_per_expert, dim=0)
+                    w1 = ctx.weight1.view(ctx.num_local_experts, ctx.hidden_size, -1)
+                    mm1_out_ = get_gmm_op_cls().op_forward(global_input_tokens, w1, group_list)[0]
+                    group_list.untyped_storage().resize_(0)
+                else:
+                    w1 = ctx.weight1.view(ctx.hidden_size, -1)
+                    mm1_out_ = torch.matmul(global_input_tokens, w1)
+
+                act_without_probs_ = ctx.activation_func(mm1_out_)
+                act_out_ = act_without_probs_ * permuted_probs_.unsqueeze(-1)
+
+                act_without_probs_size = act_without_probs_.untyped_storage().size()
+                act_without_probs.untyped_storage().resize_(act_without_probs_size)
+                act_without_probs.untyped_storage().copy_(act_without_probs_.untyped_storage())
+                act_without_probs = None
+                act_without_probs_.untyped_storage().resize_(0)
+                act_out_size = act_out_.untyped_storage().size()
+                act_out.untyped_storage().resize_(act_out_size)
+                act_out.untyped_storage().copy_(act_out_.untyped_storage())
+                act_out = None
+                act_out_.untyped_storage().resize_(0)
+                mm1_out_size = mm1_out_.untyped_storage().size()
+                mm1_out.untyped_storage().resize_(mm1_out_size)
+                mm1_out.untyped_storage().copy_(mm1_out_.untyped_storage())
+                mm1_out = None
+                mm1_out_.untyped_storage().resize_(0)
+                permuted_probs_size = permuted_probs_.untyped_storage().size()
+                expert_permuted_probs.untyped_storage().resize_(permuted_probs_size)
+                expert_permuted_probs.untyped_storage().copy_(permuted_probs_.untyped_storage())
+                expert_permuted_probs = None
+                permuted_probs_.untyped_storage().resize_(0)
+                input_size = global_input_tokens.untyped_storage().size()
+                input_.untyped_storage().resize_(input_size)
+                input_.untyped_storage().copy_(global_input_tokens.untyped_storage())
+                input_ = None
+                global_input_tokens.untyped_storage().resize_(0)
+            ctx.activation_func = None
+            ctx.hidden_size = None
+            ctx.num_local_experts = None
+            ctx.weight1 = None
+            ctx.moe_grouped_gemm = None
+            ctx.num_local_experts = None
+            ctx.input_splits = None
+            ctx.output_splits = None
+
+        # unpermute backward.
+        unpermute2_graph.backward(args[0])
+        unpermute2_graph = None
+
+        backward_func(experts_graph, unpermute1_input_detach.grad)
+        unpermute1_input_detach.grad.untyped_storage().resize_(0)
+
+        (permute1_backward_input, bw_permute1_ep_all2all_handle, 
+        permute1_prob_backward_input, bw_permute1_prob_all2all_handle) = get_all2all_experts_output()
+
+        #Overlap with async alltoall from GeMM's backward.
+        if n_shared_experts:
+            with torch.cuda.stream(ctx.moe_layer.shared_experts.stream):
+                backward_func(cached_fc1_input_graph, cached_fc1_input_detach.grad) 
+                #Avoid cached_fc1_input memory blast when TP=1.
+                if parallel_state.get_expert_tensor_parallel_world_size() > 1:
+                    cached_fc1_input_graph.untyped_storage().resize_(0)
+                    cached_fc1_input_detach.grad.untyped_storage().resize_(0)
+
+        if moe_zero_memory == "level1" and not ctx.is_only_recompute_activation:
+            if n_shared_experts:
+                ctx.shared_act_out.untyped_storage().resize_(0)
+                ctx.cached_fc1_output.untyped_storage().resize_(0)
+
+        bw_permute1_ep_all2all_handle.wait()
+        permute2_input_detach.grad.untyped_storage().resize_(0)
+
+        bw_permute1_prob_all2all_handle.wait()
+        # permute1_graph and permuted_probs_graph are in the same graph, do not execute the backward_func twice
+        torch.autograd.backward([permute1_graph, permuted_probs_graph],
+                                grad_tensors=[permute1_backward_input, permute1_prob_backward_input])
+        permute1_backward_input.untyped_storage().resize_(0)
+        permute1_prob_backward_input.untyped_storage().resize_(0)
+
+        if l_aux_graph is not None:
+            l_aux_graph.backward(l_aux_detach.grad, retain_graph=True)
+
+        route_graph.backward(detach_scores.grad)
+        route_graph = None
+        grad_output = detach_input.grad
+        #Wait stream for share_expert_overlap.
+        if n_shared_experts:
+            ctx.moe_layer.shared_experts.stream.wait_stream(torch.cuda.current_stream())
+        return grad_output, None, None
+
+    @staticmethod
+    def backward_deepep(ctx, *args):
+        """
+        Backward pass for MoE layer using DeepEP dispatch/combine.
+        
+        DeepEP's dispatch and combine are pure communication operators.
+        The backward flow is:
+        1. grad_output -> combine (distribute gradients to experts)
+        2. experts backward
+        3. dispatch (collect gradients from experts) -> grad_hidden_states
+        
+        Args:
+            ctx: Context with saved tensors
+            args[0]: Gradient from output (grad_output)
+            args[1]: Gradient from bias (not used)
+        """
+        # Unpack saved tensors according to forward order:
+        # 0: scores (route_graph)
+        # 1: scores_detach (detach_scores)
+        # 2: routing_map
+        # 3-7: DeepEP tensors (indices, probs_f16, res_send_token_small, tokens_per_expert, new_topk_idx)
+        #       saved in alltoall_token_permutation_new_deepep
+        # 8: expert_output (experts_graph)
+        # 9: expert_inputs_detach (detached inputs for experts)
+        # 10: expert_output_datach (None for DeepEP)
+        # 11: l_aux (or None)
+        # 12: l_aux_detach (or None)
+        # 13: output (combine output, no grad)
+        # 14: hidden_states (detach_input)
+        
+        saved = ctx.saved_tensors
+        route_graph = saved[0]
+        detach_scores = saved[1]
+        routing_map = saved[2]
+        
+        # DeepEP specific tensors (saved in alltoall_token_permutation_new_deepep)
+        indices = saved[3]
+        probs_f16 = saved[4]
+        res_send_token_small = saved[5]
+        tokens_per_expert = saved[6]
+        new_topk_idx = saved[7]
+        
+        experts_graph = saved[8]
+        expert_inputs_detach = saved[9]
+        # expert_output_datach is None for DeepEP
+        l_aux_graph = saved[11]
+        l_aux_detach = saved[12]
+        detach_input = saved[14]
+        
+        n_shared_experts = ctx.n_shared_experts
+        moe_zero_memory = ctx.moe_zero_memory
+        
+                #Get share_expert_graph for backward.
+        if ctx.moe_layer.shared_expert_overlap:
+            (cached_fc1_input_graph, 
+            cached_fc1_input_detach,
+        ) = ctx.share_experts_graph_list
+
+        # Get DeepEP buffer
+        import torch.distributed as dist
+        from mindspeed.buffer import DeepEPBuffer
+        ep_group = parallel_state.get_expert_model_parallel_group()
+        if get_args().moe_tp_extend_ep:
+            ep_group = parallel_state.get_tensor_and_expert_parallel_group()
+        deepep_buffer = DeepEPBuffer.get_deepep_buffer(ep_group)
+        
+        # Step 1: Backward through combine (distribute gradients to experts)
+        grad_output = args[0]
+        # Reshape grad_output to match combine input shape
+        grad_output_reshaped = grad_output.view(-1, grad_output.shape[-1])
+        # Use combine in reverse to distribute gradients to experts
+        grad_expert_output = deepep_buffer.combine(
+            grad_output_reshaped, 
+            indices, 
+            None,  # src_idx - not needed for backward
+            None,  # put_offset - not needed for backward
+            res_send_token_small, 
+            probs_f16, 
+            new_topk_idx
+        )
+        
+        # Step 2: Backward through experts
+        backward_func(experts_graph, grad_expert_output)
+        
+        # Step 3: Backward through dispatch (collect gradients from experts)
+        # Get gradient from expert input (from detached inputs)
+        if expert_inputs_detach and len(expert_inputs_detach) > 0:
+            # Get the first input tensor (dispatched_input)
+            dispatched_input_detach = expert_inputs_detach[0]
+            grad_expert_input = dispatched_input_detach.grad
+            if grad_expert_input is not None:
+                # Use dispatch in reverse to collect gradients
+                grad_hidden_states = deepep_buffer.dispatch(
+                    grad_expert_input, 
+                    indices, 
+                    tokens_per_expert, 
+                    res_send_token_small, 
+                    None,  # topk_weights - not needed for backward
+                    new_topk_idx
+                )[0]  # Get the first return value (expandx_out)
+                
+                # Reshape back to original input shape
+                grad_hidden_states = grad_hidden_states.view(detach_input.shape)
+                # Set the gradient directly
+                detach_input.grad = grad_hidden_states
+        
+        # Step 4: Backward through router
+        if l_aux_graph is not None:
+            l_aux_graph.backward(l_aux_detach.grad, retain_graph=True)
+        
+        # Step 5: Backward through route graph
+        route_graph.backward(detach_scores.grad)
+        grad_output = detach_input.grad
+
+        if n_shared_experts:
+            with torch.cuda.stream(ctx.moe_layer.shared_experts.stream):
+                backward_func(cached_fc1_input_graph, cached_fc1_input_detach.grad) 
+                #Avoid cached_fc1_input memory blast when TP=1.
+                if parallel_state.get_expert_tensor_parallel_world_size() > 1:
+                    cached_fc1_input_graph.untyped_storage().resize_(0)
+                    cached_fc1_input_detach.grad.untyped_storage().resize_(0)
+        if moe_zero_memory == "level1" and not ctx.is_only_recompute_activation:
+            if n_shared_experts:
+                ctx.shared_act_out.untyped_storage().resize_(0)
+                ctx.cached_fc1_output.untyped_storage().resize_(0)
+
+        return grad_output, None, None
