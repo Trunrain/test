@@ -1,344 +1,460 @@
-# Copyright (c) 2025, Huawei Technologies. All rights reserved.
+# Copyright (c) 2024, Huawei Technologies.
+# All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+import mindspore
+from mindspore.common.api import _convert_python_data
 import torch
 from einops import rearrange
-
-from mindspeed.core.transformer.moe.grouped_matmul_util import get_gmm_op_cls
+from megatron.training import get_args
+from megatron.core import parallel_state
+from megatron.core.parallel_state import get_expert_model_parallel_group, get_tensor_and_expert_parallel_group, get_tensor_model_parallel_group
+from megatron.core.transformer.moe.moe_utils import permute
+from mindspeed.core.tensor_parallel.comm_group_api import A2AInnerNodeComm
+from mindspeed.core.tensor_parallel.comm_group_api import A2AInterNodeComm
 from mindspeed.model.transformer import should_recompute_activation
-from mindspeed.core.transformer.moe.moe_feature.overlap.comm_utils import async_all_to_all
-from mindspeed.core.transformer.moe.moe_feature.overlap.moe_common import (only_recompute_activation, 
-                                                                           forward_func, backward_func,
-                                                                           get_gemm_backward_need_tensors, set_all2all_experts_output,
-                                                                          )
+from mindspeed.core.transformer.moe.moe_layer_overlap_all2all import gmm_op
+from mindspeed.core.transformer.moe.comm_utils import (async_all_to_all, async_reduce_scatter, async_all_gather,
+                                                       transfer_tensor_last_dim_to_first)
+from mindspeed.core.transformer.moe.moe_utils import (only_recompute_activation, forward_func, backward_func,
+                                                      get_gemm_backward_need_tensors, 
+                                                      set_all2all_experts_output, 
+                                                      permute_with_ep, get_all2all_experts_output,
+                                                      get_permute_with_ep_local_input_tokens)
 from mindspeed.ops.npu_groupmatmul_add import npu_groupmatmul_add_fp32
-from mindspeed.core.transformer.moe.moe_feature import (
-    permute,
-    sort_chunks_by_idxs,
-    parallel_state,
-    tensor_parallel,
-    reduce_scatter_to_sequence_parallel_region
-    )
 
-# 从配置中读取 DeepEP 使用标志，而不是硬编码
-use_deep_ep = False  # 默认值，实际使用时应从配置中读取
+use_deep_ep=True
 
 class GroupedMlpWithCompAndCommOverlapAll2All(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, inputs, weights1, weights2, args, moe_layer_ctx):
-        original_weight1, original_weight2, activation_func, permuted_probs, group_list, layer_number, config = args
-        ctx.config = config
-        moe_zero_memory = config.moe_zero_memory
-        ctx.layer_number = layer_number
-        ctx.moe_zero_memory = moe_zero_memory
-        ctx.activation_func = activation_func
-        use_gmm = (inputs.nelement() != 0)
-        ctx.use_gmm = use_gmm
-        gmm_cls = get_gmm_op_cls()
-        if use_gmm:
-            mm1_out = gmm_cls.op_forward(inputs, weights1, group_list)[0]
-        else:
-            mm1_out = torch.matmul(inputs, weights1)
-        if moe_zero_memory != "disable":
-            inputs.untyped_storage().resize_(0)
+    @staticmethod
+    def forward(ctx, inputs, weights1, weights2, original_weight1, original_weight2, activation_func, group_list, layer_number, freeze):
+        global_args = get_args()
+        moe_zero_memory = global_args.moe_zero_memory
+        moe_experts_pipeline_degree = global_args.moe_experts_pipeline_degree
+        ctx.layer_number = layer_number
+        ctx.freeze = freeze
+        ctx.moe_zero_memory = moe_zero_memory
+        ctx.moe_experts_pipeline_degree = moe_experts_pipeline_degree
+        use_gmm = (inputs.nelement() != 0)
+        ctx.use_gmm = use_gmm
+        if use_gmm:
+            mm1_out = gmm_op(inputs, weights1, [], group_list, 0)[0]
+        else:
+            mm1_out = torch.matmul(inputs, weights1)
+        if moe_zero_memory != "disable" or moe_experts_pipeline_degree:
+            inputs.untyped_storage().resize_(0)
+        act_out, detached_act_inputs = forward_func(activation_func, mm1_out)
 
-        def activation_func_with_probs_detach(x, probs):
-            dtype = x.dtype
-            act_without_probs = activation_func(x)
-            fin_res = act_without_probs * (probs.unsqueeze(-1))
-            return fin_res.to(dtype), act_without_probs
+        is_only_recompute_activation = only_recompute_activation(layer_number)
+        if moe_zero_memory == "level1" and not is_only_recompute_activation:
+            mm1_out.untyped_storage().resize_(0)
+        if use_gmm:
+            mm2_out = gmm_op(act_out, weights2, [], group_list, 0)[0]
+        else:
+            mm2_out = torch.matmul(act_out, weights2)
 
-        (act_out, act_without_probs), detached_act_inputs, permuted_probs_inputs_detach = forward_func(activation_func_with_probs_detach, (mm1_out, permuted_probs))
+        if moe_zero_memory == "level1" and not is_only_recompute_activation:
+            act_out.untyped_storage().resize_(0)
+            moe_layer_ctx.recompute_tensors = (inputs, mm1_out, act_out)
+        is_recompute_activation = moe_zero_memory == "level0" or should_recompute_activation(layer_number) or (
+                    moe_zero_memory == "level1" and is_only_recompute_activation)
+        if is_recompute_activation:
+            act_out.untyped_storage().resize_(0)
+            ctx.activation_func = activation_func
+        if not ctx.freeze:
+            if moe_zero_memory != "level0" and not (moe_zero_memory == "level1" and is_only_recompute_activation):
+                ctx.save_for_backward(inputs, detached_act_inputs, act_out, weights1, weights2, original_weight1,
+                                        original_weight2, group_list)
+            else:
+                ctx.save_for_backward(detached_act_inputs, act_out, weights1, weights2, original_weight1, original_weight2,
+                                        group_list)
+        else:
+            inputs.untyped_storage().resize_(0)
+            act_out.untyped_storage().resize_(0)
+            ctx.save_for_backward(detached_act_inputs, weights1, weights2, original_weight1, original_weight2, group_list)
 
-        is_only_recompute_activation = only_recompute_activation(config, layer_number)
-        if moe_zero_memory == "level1" and not is_only_recompute_activation:
-            #In zm1, recompute mm1_out and permuted_probs.
-            mm1_out.untyped_storage().resize_(0)
-            permuted_probs.untyped_storage().resize_(0)
-        if use_gmm:
-            mm2_out = gmm_cls.op_forward(act_out, weights2, group_list)[0]
-        else:
-            mm2_out = torch.matmul(act_out, weights2)
+        return mm2_out, None
 
-        if moe_zero_memory == "level1" and not is_only_recompute_activation:
-            act_without_probs.untyped_storage().resize_(0)
-            act_out.untyped_storage().resize_(0)
-            moe_layer_ctx.recompute_tensors = (inputs, mm1_out, permuted_probs, act_out, act_without_probs)
+    @staticmethod
+    def backward(ctx, *grad_outs):
+        if use_deep_ep:
+            return GroupedMlpWithCompAndCommOverlapAll2All.backward_deepep(ctx, *grad_outs)
+        else:
+            return GroupedMlpWithCompAndCommOverlapAll2All.backward_src(ctx, *grad_outs)
+    
+    @staticmethod
+    def backward_src(ctx, *grad_outs):
+        grad_outs = grad_outs[0]
+        global_args = get_args()
+        moe_hierarchical_alltoallv = global_args.moe_hierarchical_alltoallv
+        layer_number = ctx.layer_number
+        moe_zero_memory = ctx.moe_zero_memory
+        moe_experts_pipeline_degree = ctx.moe_experts_pipeline_degree
+        is_only_recompute_activation = only_recompute_activation(layer_number)
+        if not ctx.freeze:
+            if moe_zero_memory != "level0" and not (moe_zero_memory == "level1" and is_only_recompute_activation):
+                mm1_inputs, act_inputs, mm2_inputs, weights1, weights2, original_weight1, original_weight2, group_list = ctx.saved_tensors
+            else:
+                act_inputs, mm2_inputs, weights1, weights2, original_weight1, original_weight2, group_list = ctx.saved_tensors
+        else:
+            act_inputs, weights1, weights2, original_weight1, original_weight2, group_list = ctx.saved_tensors
+        if moe_experts_pipeline_degree:
+            inputs_save = get_gemm_backward_need_tensors()
+            _, inputs, ag_handle_i = async_all_gather(inputs_save, get_tensor_model_parallel_group(()), last_dim=True)
+        else:
+            ((detach_input, indices, scores_ep, router_topk, global_input_tokens_local_experts_indices),
+             permute2_input_detach, permute2_graph, output_splits, input_splits,
+             input_splits_tp_ep) = get_gemm_backward_need_tensors()
 
-        is_recompute_activation = moe_zero_memory == "level0" or should_recompute_activation(layer_number) or (
-                    moe_zero_memory == "level1" and is_only_recompute_activation)
-        if is_recompute_activation:
-            act_without_probs.untyped_storage().resize_(0)
-            act_out.untyped_storage().resize_(0)
-        if moe_zero_memory != "level0" and not (moe_zero_memory == "level1" and is_only_recompute_activation):
-            ctx.save_for_backward(inputs, permuted_probs_inputs_detach, detached_act_inputs, act_out, act_without_probs, weights1, weights2, original_weight1,
-                                  original_weight2, group_list)
-        else:
-            ctx.save_for_backward(permuted_probs_inputs_detach, detached_act_inputs, act_out, act_without_probs, weights1, weights2, original_weight1, original_weight2,
-                                  group_list)
+        # grad of mm2 dx
+        if ctx.use_gmm:
+            weights2 = rearrange(weights2, 'n h f -> n f h')
+            grad_mm2_inputs = gmm_op(grad_outs, weights2, [], group_list, 0)[0]
+        else:
+            grad_mm2_inputs = torch.matmul(grad_outs, weights2.t())
+        act_graph = mm2_inputs
+        is_recompute_activation = moe_zero_memory == "level0" or should_recompute_activation(layer_number) or (
+                    moe_zero_memory == "level1" and is_only_recompute_activation)
+        if is_recompute_activation and not ctx.freeze:
+            activation_func = ctx.activation_func
+            mm2_inputs = activation_func(act_inputs)
 
-        return mm2_out, None
+        if moe_hierarchical_alltoallv:
+            ep_group = parallel_state.get_expert_model_parallel_group()
+            tp_group = A2AInnerNodeComm.get_comm_group()
+            inter_group = A2AInterNodeComm.get_comm_group()
+            permute1_graph, scores_ep, hidden_states_ep = get_all2all_experts_output()
+            if moe_zero_memory == "disable":
+                _, detach_scores_grad, detach_scores_handle = async_reduce_scatter(scores_ep.grad, group=inter_group)
+            else:
+                detach_scores_grad = None
+                detach_scores_handle = None
 
-    @staticmethod
-    def backward(ctx, *grad_outs):
-        if use_deep_ep:
-            return GroupedMlpWithCompAndCommOverlapAll2All.backward_deepep(ctx, *grad_outs)
-        else:
-            return GroupedMlpWithCompAndCommOverlapAll2All.backward_src(ctx, *grad_outs)
+            # grad of activation_func
+            act_graph.backward(grad_mm2_inputs)
+            if moe_zero_memory == "level0" or (moe_zero_memory == "level1" and is_only_recompute_activation):
+                if moe_hierarchical_alltoallv:
+                    def alltoall_token_permutation1(hidden_states, indices, router_topk):
+                        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+                        permutated_local_input_tokens, _, _ = permute_with_ep(
+                            hidden_states, indices, probs=scores_ep, topk=router_topk, gb_inputs_splits=input_splits_tp_ep
+                        )
+                        return permutated_local_input_tokens
 
-    @staticmethod
-    def backward_src(ctx, *grad_outs):
-        grad_outs = grad_outs[0]
-        config = ctx.config
-        layer_number = ctx.layer_number
-        moe_zero_memory = ctx.moe_zero_memory
-        is_only_recompute_activation = only_recompute_activation(config, layer_number)
-        if moe_zero_memory != "level0" and not (moe_zero_memory == "level1" and is_only_recompute_activation):
-            mm1_inputs, permuted_probs_inputs_detach, act_inputs, mm2_inputs, act_without_probs, weights1, weights2, original_weight1, original_weight2, group_list = ctx.saved_tensors
-        else:
-            permuted_probs_inputs_detach, act_inputs, mm2_inputs, act_without_probs, weights1, weights2, original_weight1, original_weight2, group_list = ctx.saved_tensors
+                    permutated_local_input_tokens = alltoall_token_permutation1(detach_input, indices, router_topk)
+                else:
+                    permutated_local_input_tokens = get_permute_with_ep_local_input_tokens()
 
-        ((detach_input, probs, routing_map, num_global_tokens_per_local_expert_cpu, sort_input_by_local_experts),
-         permute2_input_detach, permute2_graph, 
-         permute2_prob_detach, permute2_prob_graph,
-         output_splits, input_splits, output_splits_tp, num_out_tokens) = get_gemm_backward_need_tensors()
+                _, global_input_tokens, permute1_ep_all_to_all_handle = async_all_to_all(
+                    permutated_local_input_tokens,
+                    output_splits,
+                    input_splits,
+                    tp_group,
+                )
 
-        gmm_cls = get_gmm_op_cls()
-        # grad of mm2
-        if ctx.use_gmm:
-            grad_mm2_inputs = gmm_cls.op_dx(grad_outs, weights2, group_list)[0]
-        else:
-            grad_mm2_inputs = torch.matmul(grad_outs, weights2.t())
-        act_graph = mm2_inputs
-        is_recompute_activation = moe_zero_memory == "level0" or should_recompute_activation(layer_number) or (
-                    moe_zero_memory == "level1" and is_only_recompute_activation)
+            # gmm1 dx
+            if ctx.use_gmm:
+                weights1 = rearrange(weights1, 'n h f -> n f h')
+                mm1_inputs_grad = \
+                    gmm_op(act_inputs.grad, weights1, [], group_list, 0)[0]
+            else:
+                mm1_inputs_grad = torch.matmul(act_inputs.grad, weights1.t())
 
-        if is_recompute_activation:
-            dtype = act_inputs.dtype
-            activation_func = ctx.activation_func
-            act_without_probs_ = activation_func(act_inputs)
-            mm2_inputs = act_without_probs_ * permuted_probs_inputs_detach.unsqueeze(-1)
-            mm2_inputs = mm2_inputs.to(dtype)
-            act_without_probs_size = act_without_probs_.untyped_storage().size()
-            act_without_probs.untyped_storage().resize_(act_without_probs_size)
-            act_without_probs.untyped_storage().copy_(act_without_probs_.untyped_storage())
-            act_without_probs = None
-            act_without_probs_.untyped_storage().resize_(0)
+            backward_func(permute2_graph, mm1_inputs_grad)
+            mm1_inputs_grad.untyped_storage().resize_(0)
+            # del mm1_inputs_grad
 
-        if ctx.use_gmm:
-            if config.gemm_gradient_accumulation_fusion:
-                grad_weights2 = gmm_cls.op_gmm_add(mm2_inputs, weights2, grad_outs, group_list, original_weight2)
-            else:
-                grad_weights2 = gmm_cls.op_dw(mm2_inputs, grad_outs, group_list)[0]
-        else:
-            grad_weights2 = torch.matmul(mm2_inputs.t(), grad_outs)
+            if moe_zero_memory == "level0" or (moe_zero_memory == "level1" and is_only_recompute_activation):
+                permute1_ep_all_to_all_handle.wait()
+                permutated_local_input_tokens.untyped_storage().resize_(0)
+            _, permute1_backward_input, bw_permute1_ep_all2all_handle = async_all_to_all(
+                permute2_input_detach.grad,
+                input_splits,
+                output_splits,
+                tp_group,
+            )
 
-        # grad of activation_func_with_probs.
-        grad_outs.untyped_storage().resize_(0)
-        mm2_inputs.untyped_storage().resize_(0)
-        act_graph.backward(grad_mm2_inputs)
-        permuted_probs_inputs_detach.untyped_storage().resize_(0)
-        grad_mm2_inputs.untyped_storage().resize_(0)
-        act_inputs.untyped_storage().resize_(0)
+        # gmm2 dw
+        if ctx.freeze:
+            grad_weights2 = None
+        else :
+            if ctx.use_gmm:
+                if get_args().gemm_gradient_accumulation_fusion:
+                    group_list_input = torch.cumsum(group_list, dim=0)
+                    npu_groupmatmul_add_fp32(mm2_inputs, grad_outs, group_list_input, original_weight2.main_grad)
 
-        if moe_zero_memory == "level0" or (moe_zero_memory == "level1" and is_only_recompute_activation):
-            def alltoall_token_permutation1(hidden_states, routing_map, probs=None):
-                hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-                permutated_local_input_tokens, permuted_probs_, _ = permute(
-                    hidden_states, routing_map, probs, num_out_tokens=num_out_tokens, fused=ctx.config.moe_permute_fusion
-                )
-                return permutated_local_input_tokens, permuted_probs_
+                    if hasattr(original_weight2, 'grad_added_to_main_grad'):
+                        if getattr(weights2, 'zero_out_wgrad', False):
+                            grad_weights2 = torch.zeros(
+                                weights2.transpose(-1, -2).shape,
+                                dtype=mm2_inputs.dtype,
+                                device=torch.cuda.current_device(),
+                                requires_grad=False,
+                            )
+                        else:
+                            grad_weights2 = torch.empty(
+                                weights2.transpose(-1, -2).shape,
+                                dtype=mm2_inputs.dtype,
+                                device=torch.cuda.current_device(),
+                                requires_grad=False,
+                            )
+                        original_weight2.grad_added_to_main_grad = True
+                    else:
+                        grad_weights2 = None
+                else:
+                    grad_weights2 = gmm_op(mm2_inputs.t(), grad_outs, [], group_list, 2)[0]
+            else:
+                grad_weights2 = torch.matmul(mm2_inputs.t(), grad_outs)
 
-            permutated_local_input_tokens, permuted_probs_ = alltoall_token_permutation1(detach_input, routing_map, probs)
+        # grad of activation_func
+        grad_outs.untyped_storage().resize_(0)
+        if not ctx.freeze:
+            mm2_inputs.untyped_storage().resize_(0)
+        if moe_hierarchical_alltoallv:
+            grad_mm2_inputs.untyped_storage().resize_(0)
+            act_inputs.untyped_storage().resize_(0)
+            bw_permute1_ep_all2all_handle.wait()
 
-            ep_group = parallel_state.get_expert_model_parallel_group()
-            _, global_input_tokens, permute1_ep_all_to_all_handle = async_all_to_all(
-                permutated_local_input_tokens,
-                output_splits,
-                input_splits,
-                ep_group,
-            )
+            backward_func(permute1_graph, permute1_backward_input)
+            permute1_backward_input.untyped_storage().resize_(0)
+            if moe_zero_memory == "disable":
+                detach_scores_handle.wait()
 
-            _, global_probs, permuted_probs_inputs_handle = async_all_to_all(
-                permuted_probs_,
-                output_splits,
-                input_splits,
-                ep_group
-            )
-        if not config.moe_permute_fusion:
-            # Because the moe_permute_fusion fusion operator needs to save routing_map for backward
-            routing_map.untyped_storage().resize_(0)
-        if ctx.use_gmm:
-            mm1_inputs_grad = gmm_cls.op_dx(act_inputs.grad, weights1, group_list)[0]
-        else:
-            mm1_inputs_grad = torch.matmul(act_inputs.grad, weights1.t())
-        probs.untyped_storage().resize_(0)
+            ep_group = A2AInterNodeComm.get_comm_group()
+            _, detach_input_grad, detach_input_handle = async_reduce_scatter(hidden_states_ep.grad, group=ep_group)
+            set_all2all_experts_output((detach_scores_grad, detach_input_grad, detach_input_handle))
+        else:
+            act_graph.backward(grad_mm2_inputs)
+            grad_mm2_inputs.untyped_storage().resize_(0)
+            act_inputs.untyped_storage().resize_(0)
+            if moe_zero_memory == "level0" or (moe_zero_memory == "level1" and is_only_recompute_activation):
+                def alltoall_token_permutation1(hidden_states, indices):
+                    hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+                    permutated_local_input_tokens, _ = permute(
+                        hidden_states, indices
+                    )
+                    return permutated_local_input_tokens
 
-        # backward for probs. 
-        backward_func(permute2_prob_graph, permuted_probs_inputs_detach.grad) 
+                permutated_local_input_tokens = alltoall_token_permutation1(detach_input, indices)
 
-        permute2_prob_detach_grad = permute2_prob_detach.grad
-        if parallel_state.get_expert_tensor_parallel_world_size() > 1:
-            permute2_prob_detach_grad = reduce_scatter_to_sequence_parallel_region(
-                permute2_prob_detach.grad,
-                group=parallel_state.get_expert_tensor_parallel_group(),
-                input_split_sizes=(
-                    output_splits_tp.tolist() if output_splits_tp is not None else None
-                ),
-            )
+                ep_group = get_expert_model_parallel_group()
+                if global_args.moe_tp_extend_ep:
+                    ep_group = get_tensor_and_expert_parallel_group()
+                _, global_input_tokens, permute1_ep_all_to_all_handle = async_all_to_all(
+                    permutated_local_input_tokens,
+                    output_splits,
+                    input_splits,
+                    ep_group,
+                )
+            if ctx.use_gmm:
+                weights1 = rearrange(weights1, 'n h f -> n f h')
+                mm1_inputs_grad = gmm_op(act_inputs.grad, weights1, [], group_list, 0)[0]
+            else:
+                mm1_inputs_grad = torch.matmul(act_inputs.grad, weights1.t())
 
-        _, permute1_prob_backward_input, bw_permute1_prob_all2all_handle = async_all_to_all(
-            permute2_prob_detach_grad,
-            input_splits,
-            output_splits,
-            parallel_state.get_expert_model_parallel_group(),
-        )
+            # 峰值
+            if moe_experts_pipeline_degree and not ctx.freeze:
+                ag_handle_i.wait()
+                mm1_inputs = torch.cat(inputs, dim=inputs_save.dim() - 1).contiguous()
+            else:
+                backward_func(permute2_graph, mm1_inputs_grad)
+                mm1_inputs_grad.untyped_storage().resize_(0)
+                # del mm1_inputs_grad
+                ep_group = get_expert_model_parallel_group()
+                if global_args.moe_tp_extend_ep:
+                    ep_group = get_tensor_and_expert_parallel_group()
 
-        # Max
-        backward_func(permute2_graph, mm1_inputs_grad)
-        mm1_inputs_grad.untyped_storage().resize_(0)
-        ep_group = parallel_state.get_expert_model_parallel_group()
+            if moe_zero_memory == "level0" or (moe_zero_memory == "level1" and is_only_recompute_activation):
+                permute1_ep_all_to_all_handle.wait()
+                permutated_local_input_tokens.untyped_storage().resize_(0)
 
-        if moe_zero_memory == "level0" or (moe_zero_memory == "level1" and is_only_recompute_activation):
-            permute1_ep_all_to_all_handle.wait()
-            permutated_local_input_tokens.untyped_storage().resize_(0)
+            if moe_experts_pipeline_degree:
+                mm1_inputs_grad, num_dim = transfer_tensor_last_dim_to_first(mm1_inputs_grad)
+                rs_input_i, expert_output, rs_handle_i = async_reduce_scatter(mm1_inputs_grad,
+                                                                              get_tensor_model_parallel_group())
+                set_all2all_experts_output((rs_input_i, expert_output, rs_handle_i, mm1_inputs_grad, num_dim))
+            else:
+                _, permute1_backward_input, bw_permute1_ep_all2all_handle = async_all_to_all(
+                    permute2_input_detach.grad,
+                    input_splits,
+                    output_splits,
+                    ep_group,
+                )
+                set_all2all_experts_output((permute1_backward_input, bw_permute1_ep_all2all_handle))
 
-        permute2_input_detach_grad = permute2_input_detach.grad
-        if parallel_state.get_expert_tensor_parallel_world_size() > 1:
-            permute2_input_detach_grad = reduce_scatter_to_sequence_parallel_region(
-                permute2_input_detach.grad,
-                group=parallel_state.get_expert_tensor_parallel_group(),
-                input_split_sizes=(
-                    output_splits_tp.tolist() if output_splits_tp is not None else None
-                ),
-            )
+        if moe_zero_memory == "level0" or (moe_zero_memory == "level1" and is_only_recompute_activation):
+            if not ctx.freeze:
+                mm1_inputs, _ = permute(
+                    global_input_tokens, global_input_tokens_local_experts_indices
+                )
 
-        _, permute1_backward_input, bw_permute1_ep_all2all_handle = async_all_to_all(
-            permute2_input_detach_grad,
-            input_splits,
-            output_splits,
-            ep_group,
-        )
-        # Async alltoall comm for permute 1 backward.
-        set_all2all_experts_output((permute1_backward_input, bw_permute1_ep_all2all_handle,
-                                    permute1_prob_backward_input, bw_permute1_prob_all2all_handle))
-        if moe_zero_memory == "level0" or (moe_zero_memory == "level1" and is_only_recompute_activation):
-            if parallel_state.get_expert_tensor_parallel_world_size() > 1:
-                global_input_tokens = tensor_parallel.gather_from_sequence_parallel_region(
-                    global_input_tokens,
-                    group=parallel_state.get_expert_tensor_parallel_group(),
-                    output_split_sizes=(
-                        output_splits_tp.tolist() if output_splits_tp is not None else None
-                    ),
-                )
-            if parallel_state.get_expert_tensor_parallel_world_size() > 1:
-                global_probs = tensor_parallel.gather_from_sequence_parallel_region(
-                    global_probs,
-                    group=parallel_state.get_expert_tensor_parallel_group(),
-                    output_split_sizes=(
-                        output_splits_tp.tolist() if output_splits_tp is not None else None
-                    ),
-                )
+            global_input_tokens.untyped_storage().resize_(0)
 
-            permuted_probs_inputs_handle.wait()
-            permuted_probs_.untyped_storage().resize_(0)
+        if ctx.freeze:
+            mm1_weights_grad = None
+        else :
+            if ctx.use_gmm:
+                if get_args().gemm_gradient_accumulation_fusion:
+                    group_list_input = torch.cumsum(group_list, dim=0)
+                    npu_groupmatmul_add_fp32(mm1_inputs, act_inputs.grad, group_list_input, original_weight1.main_grad)
+                    if hasattr(original_weight1, 'grad_added_to_main_grad'):
+                        if getattr(weights1, 'zero_out_wgrad', False):
+                            mm1_weights_grad = torch.zeros(
+                                weights1.transpose(-1, -2).shape,
+                                dtype=mm1_inputs.dtype,
+                                device=torch.cuda.current_device(),
+                                requires_grad=False,
+                            )
+                        else:
+                            mm1_weights_grad = torch.empty(
+                                weights1.transpose(-1, -2).shape,
+                                dtype=mm1_inputs.dtype,
+                                device=torch.cuda.current_device(),
+                                requires_grad=False,
+                            )
+                        original_weight1.grad_added_to_main_grad = True
+                    else:
+                        mm1_weights_grad = None
+                else:
+                    mm1_weights_grad = gmm_op(mm1_inputs.t(), act_inputs.grad, [], group_list, 2)[0]
+            else:
+                mm1_weights_grad = torch.matmul(mm1_inputs.t(), act_inputs.grad)
+        act_inputs.grad.untyped_storage().resize_(0)
+        if moe_experts_pipeline_degree:
+            return None, mm1_weights_grad, grad_weights2, None, None, None
+        else:
+            return mm1_inputs_grad, mm1_weights_grad, grad_weights2, None, None, None, None, None, None
 
-            mm1_inputs, permuted_probs_inputs_detach = sort_chunks_by_idxs(
-                global_input_tokens,
-                num_global_tokens_per_local_expert_cpu.ravel(),
-                sort_input_by_local_experts,
-                probs=global_probs
-            )
-
-            global_probs.untyped_storage().resize_(0)
-            permuted_probs_inputs_detach.untyped_storage().resize_(0)
-            global_input_tokens.untyped_storage().resize_(0)
-
-        if ctx.use_gmm:
-            if config.gemm_gradient_accumulation_fusion:
-                mm1_weights_grad = gmm_cls.op_gmm_add(mm1_inputs, weights1, act_inputs.grad, group_list,
-                                                         original_weight1)
-            else:
-                mm1_weights_grad = gmm_cls.op_dw(mm1_inputs, act_inputs.grad, group_list)[0]
-        else:
-            mm1_weights_grad = torch.matmul(mm1_inputs.t(), act_inputs.grad)
-        act_inputs.grad.untyped_storage().resize_(0)
-        permuted_probs_inputs_detach.untyped_storage().resize_(0)
-        return mm1_inputs_grad, mm1_weights_grad, grad_weights2, None, None
-
-
-    @staticmethod
+    @staticmethod
     def backward_deepep(ctx, *grad_outs):
         grad_outs = grad_outs[0]
-        config = ctx.config
         layer_number = ctx.layer_number
         moe_zero_memory = ctx.moe_zero_memory
-        is_only_recompute_activation = only_recompute_activation(config, layer_number)
-        if moe_zero_memory != "level0" and not (moe_zero_memory == "level1" and is_only_recompute_activation):
-            mm1_inputs, permuted_probs_inputs_detach, act_inputs, mm2_inputs, act_without_probs, weights1, weights2, original_weight1, original_weight2, group_list = ctx.saved_tensors
+        moe_experts_pipeline_degree = ctx.moe_experts_pipeline_degree
+        is_only_recompute_activation = only_recompute_activation(layer_number)
+        
+        # Get saved tensors based on memory configuration
+        if not ctx.freeze:
+            if moe_zero_memory != "level0" and not (moe_zero_memory == "level1" and is_only_recompute_activation):
+                mm1_inputs, act_inputs, mm2_inputs, weights1, weights2, original_weight1, original_weight2, group_list = ctx.saved_tensors
+            else:
+                act_inputs, mm2_inputs, weights1, weights2, original_weight1, original_weight2, group_list = ctx.saved_tensors
         else:
-            permuted_probs_inputs_detach, act_inputs, mm2_inputs, act_without_probs, weights1, weights2, original_weight1, original_weight2, group_list = ctx.saved_tensors
+            act_inputs, weights1, weights2, original_weight1, original_weight2, group_list = ctx.saved_tensors
 
         # For DeepEP, we don't need permute/unpermute logic
         # Just get necessary tensors for gradient calculation
-        gmm_cls = get_gmm_op_cls()
-        # grad of mm2
+        
+        # grad of mm2 dx
         if ctx.use_gmm:
-            grad_mm2_inputs = gmm_cls.op_dx(grad_outs, weights2, group_list)[0]
+            weights2 = rearrange(weights2, 'n h f -> n f h')
+            grad_mm2_inputs = gmm_op(grad_outs, weights2, [], group_list, 0)[0]
         else:
             grad_mm2_inputs = torch.matmul(grad_outs, weights2.t())
         act_graph = mm2_inputs
         is_recompute_activation = moe_zero_memory == "level0" or should_recompute_activation(layer_number) or (
                     moe_zero_memory == "level1" and is_only_recompute_activation)
 
-        if is_recompute_activation:
-            dtype = act_inputs.dtype
+        if is_recompute_activation and not ctx.freeze:
             activation_func = ctx.activation_func
-            act_without_probs_ = activation_func(act_inputs)
-            mm2_inputs = act_without_probs_ * permuted_probs_inputs_detach.unsqueeze(-1)
-            mm2_inputs = mm2_inputs.to(dtype)
-            act_without_probs_size = act_without_probs_.untyped_storage().size()
-            act_without_probs.untyped_storage().resize_(act_without_probs_size)
-            act_without_probs.untyped_storage().copy_(act_without_probs_.untyped_storage())
-            act_without_probs = None
-            act_without_probs_.untyped_storage().resize_(0)
+            mm2_inputs = activation_func(act_inputs)
 
-        if ctx.use_gmm:
-            if config.gemm_gradient_accumulation_fusion:
-                grad_weights2 = gmm_cls.op_gmm_add(mm2_inputs, weights2, grad_outs, group_list, original_weight2)
-            else:
-                grad_weights2 = gmm_cls.op_dw(mm2_inputs, grad_outs, group_list)[0]
+        # gmm2 dw
+        if ctx.freeze:
+            grad_weights2 = None
         else:
-            grad_weights2 = torch.matmul(mm2_inputs.t(), grad_outs)
+            if ctx.use_gmm:
+                if get_args().gemm_gradient_accumulation_fusion:
+                    group_list_input = torch.cumsum(group_list, dim=0)
+                    npu_groupmatmul_add_fp32(mm2_inputs, grad_outs, group_list_input, original_weight2.main_grad)
 
-        # grad of activation_func_with_probs.
+                    if hasattr(original_weight2, 'grad_added_to_main_grad'):
+                        if getattr(weights2, 'zero_out_wgrad', False):
+                            grad_weights2 = torch.zeros(
+                                weights2.transpose(-1, -2).shape,
+                                dtype=mm2_inputs.dtype,
+                                device=torch.cuda.current_device(),
+                                requires_grad=False,
+                            )
+                        else:
+                            grad_weights2 = torch.empty(
+                                weights2.transpose(-1, -2).shape,
+                                dtype=mm2_inputs.dtype,
+                                device=torch.cuda.current_device(),
+                                requires_grad=False,
+                            )
+                        original_weight2.grad_added_to_main_grad = True
+                    else:
+                        grad_weights2 = None
+                else:
+                    grad_weights2 = gmm_op(mm2_inputs.t(), grad_outs, [], group_list, 2)[0]
+            else:
+                grad_weights2 = torch.matmul(mm2_inputs.t(), grad_outs)
+
+        # grad of activation_func
         grad_outs.untyped_storage().resize_(0)
-        mm2_inputs.untyped_storage().resize_(0)
+        if not ctx.freeze:
+            mm2_inputs.untyped_storage().resize_(0)
         act_graph.backward(grad_mm2_inputs)
-        permuted_probs_inputs_detach.untyped_storage().resize_(0)
         grad_mm2_inputs.untyped_storage().resize_(0)
         act_inputs.untyped_storage().resize_(0)
 
         # Calculate gradient for mm1 inputs
         if ctx.use_gmm:
-            mm1_inputs_grad = gmm_cls.op_dx(act_inputs.grad, weights1, group_list)[0]
+            weights1 = rearrange(weights1, 'n h f -> n f h')
+            mm1_inputs_grad = gmm_op(act_inputs.grad, weights1, [], group_list, 0)[0]
         else:
             mm1_inputs_grad = torch.matmul(act_inputs.grad, weights1.t())
 
         # Calculate gradient for mm1 weights
-        if ctx.use_gmm:
-            if config.gemm_gradient_accumulation_fusion:
-                mm1_weights_grad = gmm_cls.op_gmm_add(mm1_inputs, weights1, act_inputs.grad, group_list,
-                                                         original_weight1)
-            else:
-                mm1_weights_grad = gmm_cls.op_dw(mm1_inputs, act_inputs.grad, group_list)[0]
+        if ctx.freeze:
+            mm1_weights_grad = None
         else:
-            mm1_weights_grad = torch.matmul(mm1_inputs.t(), act_inputs.grad)
+            if ctx.use_gmm:
+                if get_args().gemm_gradient_accumulation_fusion:
+                    group_list_input = torch.cumsum(group_list, dim=0)
+                    npu_groupmatmul_add_fp32(mm1_inputs, act_inputs.grad, group_list_input, original_weight1.main_grad)
+                    if hasattr(original_weight1, 'grad_added_to_main_grad'):
+                        if getattr(weights1, 'zero_out_wgrad', False):
+                            mm1_weights_grad = torch.zeros(
+                                weights1.transpose(-1, -2).shape,
+                                dtype=mm1_inputs.dtype,
+                                device=torch.cuda.current_device(),
+                                requires_grad=False,
+                            )
+                        else:
+                            mm1_weights_grad = torch.empty(
+                                weights1.transpose(-1, -2).shape,
+                                dtype=mm1_inputs.dtype,
+                                device=torch.cuda.current_device(),
+                                requires_grad=False,
+                            )
+                        original_weight1.grad_added_to_main_grad = True
+                    else:
+                        mm1_weights_grad = None
+                else:
+                    mm1_weights_grad = gmm_op(mm1_inputs.t(), act_inputs.grad, [], group_list, 2)[0]
+            else:
+                mm1_weights_grad = torch.matmul(mm1_inputs.t(), act_inputs.grad)
         act_inputs.grad.untyped_storage().resize_(0)
-        permuted_probs_inputs_detach.untyped_storage().resize_(0)
         
         # For DeepEP, communication is handled by combine/dispatch outside this function
         # So we don't need to set alltoall outputs here
-        return mm1_inputs_grad, mm1_weights_grad, grad_weights2, None, None
+        if moe_experts_pipeline_degree:
+            return None, mm1_weights_grad, grad_weights2, None, None, None
+        else:
+            return mm1_inputs_grad, mm1_weights_grad, grad_weights2, None, None, None, None, None, None
 
-def grouped_mlp_with_comp_and_comm_overlap_all2all(inputs, weights1, weights2, args, ctx):
-    return GroupedMlpWithCompAndCommOverlapAll2All.apply(inputs, weights1, weights2, args, ctx)
+def grouped_mlp_with_comp_and_comm_overlap_all2all(inputs, weights1, weights2, args):
+    return GroupedMlpWithCompAndCommOverlapAll2All.apply(inputs, weights1, weights2, *args)
